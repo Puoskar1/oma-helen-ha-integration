@@ -1,5 +1,7 @@
 """Test the Helen Energy sensor platform."""
 
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +14,9 @@ from custom_components.helen_energy.sensor import (
     HelenMarketPriceElectricity,
     HelenMonthlyConsumption,
     HelenTransferPrice,
+    _build_hourly_consumption_kwh_from_quarters,
+    _generate_hourly_kwh_states,
+    _parse_helen_datetime,
 )
 
 
@@ -288,3 +293,37 @@ class TestHelenMonthlyConsumption:
             # Sensor returns 0 when no data is available instead of None
             assert sensor.native_value == 0
             assert sensor.native_value == 0
+
+
+class TestConsumptionStatisticsHelpers:
+    """Test helper functions for statistics import."""
+
+    def test_parse_helen_datetime_accepts_z_suffix(self):
+        parsed = _parse_helen_datetime("2025-01-10T12:00:00Z")
+        assert parsed == datetime(2025, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_build_hourly_consumption_kwh_from_quarters_groups_by_hour(self):
+        now_utc = datetime(2025, 1, 10, 12, 30, tzinfo=timezone.utc)
+        series = [
+            SimpleNamespace(start="2025-01-10T11:45:00+00:00", electricity=0.1),
+            SimpleNamespace(start="2025-01-10T12:00:00+00:00", electricity=0.2),
+            SimpleNamespace(start="2025-01-10T12:15:00+00:00", electricity=0.3),
+            SimpleNamespace(start="2025-01-10T12:45:00+00:00", electricity=0.4),  # future
+        ]
+        hourly = _build_hourly_consumption_kwh_from_quarters(series, now_utc)
+        assert hourly == {
+            datetime(2025, 1, 10, 11, 0, tzinfo=timezone.utc): 0.1,
+            datetime(2025, 1, 10, 12, 0, tzinfo=timezone.utc): 0.5,
+        }
+
+    def test_generate_hourly_kwh_states_fills_gaps(self):
+        hourly_consumption = {
+            datetime(2025, 1, 10, 10, 0, tzinfo=timezone.utc): 1.0,
+            datetime(2025, 1, 10, 12, 0, tzinfo=timezone.utc): 2.0,
+        }
+        hourly_state = _generate_hourly_kwh_states(hourly_consumption)
+        assert hourly_state == {
+            datetime(2025, 1, 10, 10, 0, tzinfo=timezone.utc): 1.0,
+            datetime(2025, 1, 10, 11, 0, tzinfo=timezone.utc): 1.0,
+            datetime(2025, 1, 10, 12, 0, tzinfo=timezone.utc): 3.0,
+        }

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from dateutil.relativedelta import relativedelta
@@ -17,11 +18,14 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, UnitOfEnergy
+from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
 )
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_CONTRACT_TYPE,
@@ -50,6 +54,11 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 SCAN_INTERVAL = timedelta(hours=3)
+
+try:
+    from helenservice.const import RESOLUTION_QUARTER
+except Exception:
+    RESOLUTION_QUARTER = "quarter"
 
 
 def safe_round(value: float | None, decimals: int = 2) -> float:
@@ -113,156 +122,156 @@ class HelenDataCoordinator(DataUpdateCoordinator):
         self.credentials = credentials
         self.delivery_site_id = delivery_site_id
         self.include_transfer_costs = include_transfer_costs
+        self._api_lock = asyncio.Lock()
 
     async def _async_update_data(self):
         """Fetch data from Helen API."""
-        try:
-            await _login_helen_api_if_needed(
-                self.hass, self.api_client, self.credentials
-            )
-            _select_delivery_site(self.api_client, self.delivery_site_id)
+        async with self._api_lock:
+            try:
+                await _login_helen_api_if_needed(
+                    self.hass, self.api_client, self.credentials
+                )
+                _select_delivery_site(self.api_client, self.delivery_site_id)
 
-            # Get all the data we need
-            _LOGGER.debug("Starting data fetch from Helen API")
+                # Get all the data we need
+                _LOGGER.debug("Starting data fetch from Helen API")
 
-            data = {}
+                data = {}
 
-            _LOGGER.debug("Fetching current month consumption")
-            data[
-                "current_month_consumption"
-            ] = await _get_total_consumption_for_current_month(
-                self.hass, self.api_client
-            )
-
-            _LOGGER.debug("Fetching last month consumption")
-            data[
-                "last_month_consumption"
-            ] = await _get_total_consumption_for_last_month(self.hass, self.api_client)
-
-            _LOGGER.debug("Fetching daily average consumption")
-            data[
-                "daily_average_consumption"
-            ] = await _get_average_daily_consumption_for_current_month(
-                self.hass, self.api_client
-            )
-
-            if self.include_transfer_costs:
-                _LOGGER.debug("Fetching transfer costs")
+                _LOGGER.debug("Fetching current month consumption")
                 data[
-                    "transfer_costs"
-                ] = await get_transfer_price_total_for_current_month(
+                    "current_month_consumption"
+                ] = await _get_total_consumption_for_current_month(
                     self.hass, self.api_client
                 )
-            else:
-                data["transfer_costs"] = 0.0
 
-            _LOGGER.debug("Fetching contract base price")
-            data["contract_base_price"] = await self.hass.async_add_executor_job(
-                self.api_client.get_contract_base_price
-            )
-
-            _LOGGER.debug("Fetching contract type")
-            data["contract_type"] = await self.hass.async_add_executor_job(
-                self.api_client.get_contract_type
-            )
-
-            # Get prices based on contract type
-            try:
-                _LOGGER.debug("Fetching unit price")
-                data["unit_price"] = await self.hass.async_add_executor_job(
-                    self.api_client.get_contract_energy_unit_price
+                _LOGGER.debug("Fetching last month consumption")
+                data[
+                    "last_month_consumption"
+                ] = await _get_total_consumption_for_last_month(
+                    self.hass, self.api_client
                 )
-            except InvalidApiResponseException as e:
-                _LOGGER.debug("Failed to get unit price: %s", e)
-                data["unit_price"] = None
 
-            # Get market prices if needed
-            try:
-                prices = await self.hass.async_add_executor_job(
-                    self.price_client.get_market_price_prices
+                _LOGGER.debug("Fetching daily average consumption")
+                data[
+                    "daily_average_consumption"
+                ] = await _get_average_daily_consumption_for_current_month(
+                    self.hass, self.api_client
                 )
-                if prices is not None:
-                    data["market_prices"] = {
-                        "last_month": getattr(prices, "last_month", None),
-                        "current_month": getattr(prices, "current_month", None),
-                        "next_month": getattr(prices, "next_month", None),
-                    }
+
+                if self.include_transfer_costs:
+                    _LOGGER.debug("Fetching transfer costs")
+                    data[
+                        "transfer_costs"
+                    ] = await get_transfer_price_total_for_current_month(
+                        self.hass, self.api_client
+                    )
                 else:
+                    data["transfer_costs"] = 0.0
+
+                _LOGGER.debug("Fetching contract base price")
+                data["contract_base_price"] = await self.hass.async_add_executor_job(
+                    self.api_client.get_contract_base_price
+                )
+
+                _LOGGER.debug("Fetching contract type")
+                data["contract_type"] = await self.hass.async_add_executor_job(
+                    self.api_client.get_contract_type
+                )
+
+                # Get prices based on contract type
+                try:
+                    _LOGGER.debug("Fetching unit price")
+                    data["unit_price"] = await self.hass.async_add_executor_job(
+                        self.api_client.get_contract_energy_unit_price
+                    )
+                except InvalidApiResponseException as e:
+                    _LOGGER.debug("Failed to get unit price: %s", e)
+                    data["unit_price"] = None
+
+                # Get market prices if needed
+                try:
+                    prices = await self.hass.async_add_executor_job(
+                        self.price_client.get_market_price_prices
+                    )
+                    if prices is not None:
+                        data["market_prices"] = {
+                            "last_month": getattr(prices, "last_month", None),
+                            "current_month": getattr(prices, "current_month", None),
+                            "next_month": getattr(prices, "next_month", None),
+                        }
+                    else:
+                        data["market_prices"] = None
+                except (InvalidApiResponseException, AttributeError) as e:
+                    _LOGGER.debug("Failed to get market prices: %s", e)
                     data["market_prices"] = None
-            except (InvalidApiResponseException, AttributeError) as e:
-                _LOGGER.debug("Failed to get market prices: %s", e)
-                data["market_prices"] = None
 
-            # Get exchange prices if needed
-            try:
-                exchange_prices = await self.hass.async_add_executor_job(
-                    self.price_client.get_exchange_prices
-                )
-                if exchange_prices is not None:
-                    data["exchange_prices"] = {"margin": exchange_prices.margin}
-                else:
+                # Get exchange prices if needed
+                try:
+                    exchange_prices = await self.hass.async_add_executor_job(
+                        self.price_client.get_exchange_prices
+                    )
+                    if exchange_prices is not None:
+                        data["exchange_prices"] = {"margin": exchange_prices.margin}
+                    else:
+                        data["exchange_prices"] = None
+                except (InvalidApiResponseException, AttributeError) as e:
+                    _LOGGER.debug("Failed to get exchange prices: %s", e)
                     data["exchange_prices"] = None
-            except (InvalidApiResponseException, AttributeError) as e:
-                _LOGGER.debug("Failed to get exchange prices: %s", e)
-                data["exchange_prices"] = None
 
-            # Calculate spot price costs for exchange electricity
-            try:
-                current_month = date.today()
-                last_month = current_month + relativedelta(months=-1)
+                # Calculate spot price costs for exchange electricity
+                try:
+                    current_month = date.today()
+                    last_month = current_month + relativedelta(months=-1)
 
-                current_month_cost = await self.hass.async_add_executor_job(
-                    self.api_client.calculate_total_costs_by_spot_prices_between_dates,
-                    *get_month_date_range_by_date(current_month),
+                    current_month_cost = await self.hass.async_add_executor_job(
+                        self.api_client.calculate_total_costs_by_spot_prices_between_dates,
+                        *get_month_date_range_by_date(current_month),
+                    )
+                    last_month_cost = await self.hass.async_add_executor_job(
+                        self.api_client.calculate_total_costs_by_spot_prices_between_dates,
+                        *get_month_date_range_by_date(last_month),
+                    )
+
+                    data["exchange_costs"] = {
+                        "current_month": safe_round(current_month_cost),
+                        "last_month": safe_round(last_month_cost),
+                    }
+                except InvalidApiResponseException:
+                    data["exchange_costs"] = None
+
+                # Calculate smart guarantee costs
+                try:
+                    current_month = date.today()
+                    current_month_impact = await self.hass.async_add_executor_job(
+                        self.api_client.calculate_impact_of_usage_between_dates,
+                        *get_month_date_range_by_date(current_month),
+                    )
+                    data["smart_guarantee"] = {
+                        "current_month_impact": current_month_impact,
+                    }
+                except InvalidApiResponseException:
+                    data["smart_guarantee"] = None
+
+            except InvalidApiResponseException as err:
+                if "authentication" in str(err).lower():
+                    raise ConfigEntryAuthFailed from err
+                _LOGGER.warning(
+                    "Error communicating with Helen API, keeping last known values: %s",
+                    err,
                 )
-                last_month_cost = await self.hass.async_add_executor_job(
-                    self.api_client.calculate_total_costs_by_spot_prices_between_dates,
-                    *get_month_date_range_by_date(last_month),
+                return self.data if self.data is not None else {}
+            except Exception as err:
+                _LOGGER.error(
+                    "Unexpected error fetching Helen data, keeping last known values: %s",
+                    err,
                 )
-
-                data["exchange_costs"] = {
-                    "current_month": safe_round(current_month_cost),
-                    "last_month": safe_round(last_month_cost),
-                }
-            except InvalidApiResponseException:
-                data["exchange_costs"] = None
-
-            # Calculate smart guarantee costs
-            try:
-                current_month = date.today()
-                current_month_impact = await self.hass.async_add_executor_job(
-                    self.api_client.calculate_impact_of_usage_between_dates,
-                    *get_month_date_range_by_date(current_month),
-                )
-                data["smart_guarantee"] = {
-                    "current_month_impact": current_month_impact,
-                }
-            except InvalidApiResponseException:
-                data["smart_guarantee"] = None
-
-        except InvalidApiResponseException as err:
-            if "authentication" in str(err).lower():
-                # Trigger reauth if it's an auth error
-                raise ConfigEntryAuthFailed from err
-            # For network/API errors, log the error but keep the last known data
-            _LOGGER.warning(
-                "Error communicating with Helen API, keeping last known values: %s", err
-            )
-            # Return the existing data if available, otherwise return empty dict
-            return self.data if self.data is not None else {}
-        except Exception as err:
-            # For unexpected errors, log but don't fail the update
-            _LOGGER.error(
-                "Unexpected error fetching Helen data, keeping last known values: %s",
-                err,
-            )
-            _LOGGER.error("Exception traceback:", exc_info=True)
-            # Return the existing data if available, otherwise return empty dict
-            return self.data if self.data is not None else {}
-        else:
-            return data
-        finally:
-            self.api_client.close()
+                _LOGGER.error("Exception traceback:", exc_info=True)
+                return self.data if self.data is not None else {}
+            else:
+                return data
+            finally:
+                self.api_client.close()
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
@@ -489,6 +498,58 @@ async def _get_average_daily_consumption_for_current_month(
         sum(valid_measurements) / len(valid_measurements) if valid_measurements else 0
     )
     return safe_round(average)
+
+
+def _parse_helen_datetime(value: str) -> datetime:
+    value = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return dt_util.as_utc(parsed)
+
+
+def _build_hourly_consumption_kwh_from_quarters(
+    quarter_series: list[Any], now_utc: datetime
+) -> dict[datetime, float]:
+    hourly: dict[datetime, float] = {}
+    for series in quarter_series:
+        electricity = getattr(series, "electricity", None)
+        if electricity is None:
+            continue
+        try:
+            electricity_value = float(electricity)
+        except (TypeError, ValueError):
+            continue
+
+        try:
+            start = _parse_helen_datetime(getattr(series, "start"))
+        except (TypeError, ValueError):
+            continue
+        if start > now_utc:
+            continue
+
+        hour_start = start.replace(minute=0, second=0, microsecond=0)
+        hourly[hour_start] = hourly.get(hour_start, 0.0) + electricity_value
+    return hourly
+
+
+def _generate_hourly_kwh_states(
+    hourly_consumption_kwh: dict[datetime, float],
+) -> dict[datetime, float]:
+    if not hourly_consumption_kwh:
+        return {}
+    sorted_hours = sorted(hourly_consumption_kwh)
+    start_hour = sorted_hours[0]
+    end_hour = sorted_hours[-1]
+
+    current_hour = start_hour
+    running_total = 0.0
+    hourly_state: dict[datetime, float] = {}
+    while current_hour <= end_hour:
+        running_total += hourly_consumption_kwh.get(current_hour, 0.0)
+        hourly_state[current_hour] = running_total
+        current_hour += timedelta(hours=1)
+    return hourly_state
 
 
 class HelenBaseSensor(CoordinatorEntity, SensorEntity):
@@ -999,10 +1060,166 @@ class HelenMonthlyConsumption(CoordinatorEntity, SensorEntity):
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
         self._attr_icon = "mdi:home-lightning-bolt"
+        self._statistics_import_lock = asyncio.Lock()
+        self._statistics_store: Store | None = None
+        self._statistics_import_task: asyncio.Task[None] | None = None
+        self._month_total_from_quarters: float | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Run when entity is added to Home Assistant."""
+        await super().async_added_to_hass()
+
+        store_key = (
+            f"{DOMAIN}_statistics_{self.coordinator.config_entry.entry_id}"
+            f"_{self._attr_unique_id}"
+        )
+        self._statistics_store = Store(self.hass, 1, store_key)
+
+        self._schedule_statistics_import(initial=True)
+        self.async_on_remove(self._cancel_statistics_import)
+        self.async_on_remove(self.coordinator.async_add_listener(self._on_coordinator_update))
+
+    @callback
+    def _on_coordinator_update(self) -> None:
+        self._schedule_statistics_import(initial=False)
+
+    @callback
+    def _schedule_statistics_import(self, *, initial: bool) -> None:
+        if self._statistics_import_task and not self._statistics_import_task.done():
+            return
+        self._statistics_import_task = self.hass.async_create_task(
+            self._async_import_hourly_statistics(initial=initial)
+        )
+
+    @callback
+    def _cancel_statistics_import(self) -> None:
+        if self._statistics_import_task and not self._statistics_import_task.done():
+            self._statistics_import_task.cancel()
+        self._statistics_import_task = None
 
     @property
     def native_value(self) -> float:
         """Return the state of the sensor."""
+        if self._month_total_from_quarters is not None:
+            return safe_round(self._month_total_from_quarters)
         if self.coordinator.data is None:
             return 0
         return safe_round(self.coordinator.data.get("current_month_consumption", 0))
+
+    async def _async_import_hourly_statistics(self, *, initial: bool) -> None:
+        if self._statistics_store is None:
+            return
+
+        async with self._statistics_import_lock:
+            try:
+                from homeassistant.components.recorder import statistics as recorder_statistics
+                from homeassistant.components.recorder.const import DOMAIN as RECORDER_DOMAIN
+            except Exception as err:
+                _LOGGER.debug("Recorder statistics unavailable, skipping import: %s", err)
+                return
+
+            current_local_date = dt_util.now().date()
+            month_start_date = current_local_date.replace(day=1)
+
+            stored = await self._statistics_store.async_load() or {}
+            stored_month_start = stored.get("month_start")
+            sum_offset_kwh = float(stored.get("sum_offset_kwh", 0.0) or 0.0)
+            last_imported_sum_kwh = stored.get("last_imported_sum_kwh")
+            last_imported_hour_raw = stored.get("last_imported_hour_utc")
+
+            if stored_month_start != month_start_date.isoformat() and last_imported_sum_kwh is not None:
+                sum_offset_kwh = float(last_imported_sum_kwh)
+
+            import_start_utc: datetime | None = None
+            if initial or last_imported_hour_raw is None:
+                import_start_utc = None
+            else:
+                try:
+                    import_start_utc = dt_util.as_utc(_parse_helen_datetime(last_imported_hour_raw))
+                except Exception:
+                    import_start_utc = None
+
+            now_utc = dt_util.utcnow()
+
+            async with self.coordinator._api_lock:
+                try:
+                    await _login_helen_api_if_needed(
+                        self.hass, self.coordinator.api_client, self.coordinator.credentials
+                    )
+                    _select_delivery_site(
+                        self.coordinator.api_client, self.coordinator.delivery_site_id
+                    )
+                    response = await self.hass.async_add_executor_job(
+                        self.coordinator.api_client.get_measurements_with_spot_prices,
+                        month_start_date,
+                        current_local_date,
+                        RESOLUTION_QUARTER,
+                    )
+                except InvalidApiResponseException as err:
+                    _LOGGER.debug("Failed to fetch quarterly measurements: %s", err)
+                    return
+                finally:
+                    self.coordinator.api_client.close()
+
+            quarter_series = getattr(response, "series", None)
+            if not quarter_series:
+                return
+
+            hourly_consumption = _build_hourly_consumption_kwh_from_quarters(
+                quarter_series, now_utc
+            )
+            hourly_state = _generate_hourly_kwh_states(hourly_consumption)
+            if not hourly_state:
+                return
+
+            latest_hour = max(hourly_state)
+            self._month_total_from_quarters = hourly_state[latest_hour]
+
+            if import_start_utc is None:
+                import_start_utc = min(hourly_state)
+            else:
+                import_start_utc = max(
+                    min(hourly_state),
+                    import_start_utc - timedelta(days=1),
+                )
+
+            stats: list[dict[str, Any]] = []
+            for hour_start, month_total in hourly_state.items():
+                if hour_start < import_start_utc:
+                    continue
+                stats.append(
+                    {
+                        "start": hour_start,
+                        "state": month_total,
+                        "sum": sum_offset_kwh + month_total,
+                    }
+                )
+
+            if not stats:
+                return
+
+            metadata = {
+                "has_mean": False,
+                "has_sum": True,
+                "name": None,
+                "source": RECORDER_DOMAIN,
+                "statistic_id": self.entity_id,
+                "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
+            }
+
+            try:
+                recorder_statistics.async_import_statistics(self.hass, metadata, stats)
+            except Exception as err:
+                _LOGGER.debug("Failed to import statistics: %s", err)
+                return
+
+            last = stats[-1]
+            await self._statistics_store.async_save(
+                {
+                    "month_start": month_start_date.isoformat(),
+                    "sum_offset_kwh": sum_offset_kwh,
+                    "last_imported_hour_utc": dt_util.as_utc(last["start"]).isoformat(),
+                    "last_imported_sum_kwh": last["sum"],
+                }
+            )
+            self.async_write_ha_state()
