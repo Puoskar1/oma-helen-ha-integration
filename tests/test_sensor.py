@@ -200,6 +200,9 @@ class TestHelenMarketPriceElectricity:
             assert attributes["price_current_month"] == 90.0
             assert attributes["price_last_month"] == 85.0
             assert attributes["price_next_month"] == 88.0
+            # Exposed for UI selection (Tile card etc.)
+            expected_value = round(5.0 + (90.0 / 100) * 150.5 + (2 * 4.8) * (90.0 / 100), 2)
+            assert attributes["current_month_cost_estimate"] == expected_value
 
 
 class TestHelenExchangeElectricity:

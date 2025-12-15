@@ -87,6 +87,9 @@ STATE_ATTR_LAST_MONTH_TOTAL_COST = "last_month_total_cost"
 STATE_ATTR_CURRENT_MONTH_TOTAL_COST = "current_month_total_cost"
 
 # market price
+STATE_ATTR_CURRENT_MONTH_COST_ESTIMATE = "current_month_cost_estimate"
+
+# market price
 STATE_ATTR_PRICE_LAST_MONTH = "price_last_month"
 STATE_ATTR_PRICE_CURRENT_MONTH = "price_current_month"
 STATE_ATTR_PRICE_NEXT_MONTH = "price_next_month"
@@ -686,7 +689,7 @@ class HelenMarketPriceElectricity(HelenBaseSensor):
             return None
 
         data = self.coordinator.data
-        market_prices = data.get("market_prices", {})
+        market_prices = data.get("market_prices") or {}
         base_price = self._get_base_price(data)
         current_month_consumption = data.get("current_month_consumption", 0)
         daily_average_consumption = data.get("daily_average_consumption", 0)
@@ -712,9 +715,11 @@ class HelenMarketPriceElectricity(HelenBaseSensor):
             return {}
 
         data = self.coordinator.data
-        market_prices = data.get("market_prices", {})
+        market_prices = data.get("market_prices") or {}
         base_price = self._get_base_price(data)
         last_month_consumption = data.get("last_month_consumption", 0)
+        current_month_consumption = data.get("current_month_consumption", 0)
+        daily_average_consumption = data.get("daily_average_consumption", 0)
 
         # Calculate last month total cost
         last_month_price = market_prices.get("last_month", 0) / 100
@@ -723,20 +728,29 @@ class HelenMarketPriceElectricity(HelenBaseSensor):
         )
 
         # Use default unit price for current month if set
-        current_month_price = (
+        current_month_price_cents = (
             self._default_unit_price
             if self._default_unit_price is not None
             else market_prices.get("current_month")
+        )
+        current_month_price_eur = (
+            float(current_month_price_cents) / 100 if current_month_price_cents else 0.0
+        )
+        current_month_cost_estimate = safe_round(
+            base_price
+            + (current_month_price_eur * current_month_consumption)
+            + (2 * daily_average_consumption * current_month_price_eur)
         )
 
         attributes = {
             STATE_ATTR_CONTRACT_BASE_PRICE: base_price,
             STATE_ATTR_LAST_MONTH_TOTAL_COST: last_month_total_cost,
+            STATE_ATTR_CURRENT_MONTH_COST_ESTIMATE: current_month_cost_estimate,
             STATE_ATTR_PRICE_LAST_MONTH: safe_round(market_prices.get("last_month"))
             if market_prices.get("last_month") is not None
             else None,
-            STATE_ATTR_PRICE_CURRENT_MONTH: safe_round(current_month_price)
-            if current_month_price is not None
+            STATE_ATTR_PRICE_CURRENT_MONTH: safe_round(current_month_price_cents)
+            if current_month_price_cents is not None
             else None,
             STATE_ATTR_PRICE_NEXT_MONTH: safe_round(market_prices.get("next_month"))
             if market_prices.get("next_month") is not None
