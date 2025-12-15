@@ -13,6 +13,7 @@ from custom_components.helen_energy.sensor import (
     HelenFixedPriceElectricity,
     HelenMarketPriceElectricity,
     HelenMonthlyConsumption,
+    HelenTotalCost,
     HelenTransferPrice,
     _build_hourly_consumption_kwh_from_quarters,
     _generate_hourly_kwh_states,
@@ -260,6 +261,58 @@ class TestHelenMarketPriceElectricity:
             expected_estimate = round(5.0 + (4.8 * 31) * (90.0 / 100), 2)
             assert attributes["current_month_cost_so_far"] == expected_so_far
             assert attributes["current_month_cost_estimate"] == expected_estimate
+
+
+class TestHelenTotalCost:
+    """Test cumulative total cost sensor."""
+
+    def test_total_cost_sensor_fixed_price_initial_value(self, mock_coordinator, mock_coordinator_data):
+        mock_coordinator.data = mock_coordinator_data
+
+        with (
+            patch(
+                "custom_components.helen_energy.migration.should_use_legacy_names",
+                return_value=False,
+            ),
+            patch(
+                "custom_components.helen_energy.sensor.dt_util.now",
+                return_value=datetime(2025, 12, 15, tzinfo=timezone.utc),
+            ),
+        ):
+            sensor = HelenTotalCost(mock_coordinator, "fixed")
+            assert sensor.device_class == "monetary"
+            assert sensor.state_class == "total_increasing"
+            assert sensor.native_value == round(150.5 * 8.5 / 100 + 5.0, 2)
+
+    def test_total_cost_rolls_over_on_new_month(self, mock_coordinator, mock_coordinator_data):
+        mock_data = dict(mock_coordinator_data)
+        mock_coordinator.data = mock_data
+
+        with (
+            patch(
+                "custom_components.helen_energy.migration.should_use_legacy_names",
+                return_value=False,
+            ),
+            patch(
+                "custom_components.helen_energy.sensor.dt_util.now",
+                side_effect=[
+                    datetime(2025, 12, 31, 23, 0, tzinfo=timezone.utc),
+                    datetime(2025, 12, 31, 23, 0, tzinfo=timezone.utc),
+                    datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc),
+                    datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc),
+                ],
+            ),
+        ):
+            sensor = HelenTotalCost(mock_coordinator, "fixed")
+            december_total = sensor.native_value
+
+            # Simulate new month consumption reset
+            mock_data["current_month_consumption"] = 10.0
+            january_total = sensor.native_value
+
+            assert december_total is not None
+            assert january_total is not None
+            assert january_total > december_total
 
 
 class TestHelenExchangeElectricity:

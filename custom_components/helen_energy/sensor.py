@@ -356,10 +356,26 @@ async def async_setup_entry(
                 coordinator, default_base_price, default_unit_price
             )
         )
+        entities.append(
+            HelenTotalCost(
+                coordinator,
+                CONTRACT_TYPE_FIXED,
+                default_base_price=default_base_price,
+                default_unit_price=default_unit_price,
+            )
+        )
     elif user_contract_type == CONTRACT_TYPE_MARKET:
         entities.append(
             HelenMarketPriceElectricity(
                 coordinator, default_base_price, default_unit_price
+            )
+        )
+        entities.append(
+            HelenTotalCost(
+                coordinator,
+                CONTRACT_TYPE_MARKET,
+                default_base_price=default_base_price,
+                default_unit_price=default_unit_price,
             )
         )
     elif user_contract_type == CONTRACT_TYPE_EXCHANGE:
@@ -368,6 +384,13 @@ async def async_setup_entry(
                 "Default unit price set but will not be used with EXCHANGE contract"
             )
         entities.append(HelenExchangeElectricity(coordinator, default_base_price))
+        entities.append(
+            HelenTotalCost(
+                coordinator,
+                CONTRACT_TYPE_EXCHANGE,
+                default_base_price=default_base_price,
+            )
+        )
     elif user_contract_type == CONTRACT_TYPE_AUTOMATIC:
         # Fall back to API-based detection for automatic mode
         api_contract_type = coordinator.data.get("contract_type")
@@ -379,10 +402,26 @@ async def async_setup_entry(
                     coordinator, default_base_price, default_unit_price
                 )
             )
+            entities.append(
+                HelenTotalCost(
+                    coordinator,
+                    CONTRACT_TYPE_FIXED,
+                    default_base_price=default_base_price,
+                    default_unit_price=default_unit_price,
+                )
+            )
         elif api_contract_type is not None and "MARK" in api_contract_type:
             entities.append(
                 HelenMarketPriceElectricity(
                     coordinator, default_base_price, default_unit_price
+                )
+            )
+            entities.append(
+                HelenTotalCost(
+                    coordinator,
+                    CONTRACT_TYPE_MARKET,
+                    default_base_price=default_base_price,
+                    default_unit_price=default_unit_price,
                 )
             )
         elif api_contract_type is not None and "PORS" in api_contract_type:
@@ -391,9 +430,24 @@ async def async_setup_entry(
                     "Default unit price set but will not be used with EXCHANGE contract"
                 )
             entities.append(HelenExchangeElectricity(coordinator, default_base_price))
+            entities.append(
+                HelenTotalCost(
+                    coordinator,
+                    CONTRACT_TYPE_EXCHANGE,
+                    default_base_price=default_base_price,
+                )
+            )
         elif api_contract_type is not None and "VALTTI" in api_contract_type:
             entities.append(
                 HelenSmartGuarantee(coordinator, default_base_price, default_unit_price)
+            )
+            entities.append(
+                HelenTotalCost(
+                    coordinator,
+                    "smart_guarantee",
+                    default_base_price=default_base_price,
+                    default_unit_price=default_unit_price,
+                )
             )
         else:
             # API contract type is None or unsupported - default to fixed price
@@ -406,6 +460,14 @@ async def async_setup_entry(
                     coordinator, default_base_price, default_unit_price
                 )
             )
+            entities.append(
+                HelenTotalCost(
+                    coordinator,
+                    CONTRACT_TYPE_FIXED,
+                    default_base_price=default_base_price,
+                    default_unit_price=default_unit_price,
+                )
+            )
     else:
         # Unknown user contract type - shouldn't happen but default to fixed price
         _LOGGER.warning(
@@ -415,6 +477,14 @@ async def async_setup_entry(
         entities.append(
             HelenFixedPriceElectricity(
                 coordinator, default_base_price, default_unit_price
+            )
+        )
+        entities.append(
+            HelenTotalCost(
+                coordinator,
+                CONTRACT_TYPE_FIXED,
+                default_base_price=default_base_price,
+                default_unit_price=default_unit_price,
             )
         )
 
@@ -1088,6 +1158,184 @@ class HelenFixedPriceElectricity(HelenBaseSensor):
         unit_price_cents = float(self._get_unit_price(data))
         base_price = self._get_current_month_base_price(data)
         return base_price + (avg_daily_kwh * active_days * (unit_price_cents / 100.0))
+
+
+class HelenTotalCost(CoordinatorEntity, SensorEntity):
+    """Cumulative electricity cost sensor for the Energy dashboard."""
+
+    _attr_native_unit_of_measurement = "EUR"
+    _attr_icon = "mdi:cash-sync"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(
+        self,
+        coordinator: HelenDataCoordinator,
+        cost_mode: str,
+        default_base_price: float | None = None,
+        default_unit_price: float | None = None,
+        name: str | None = None,
+    ) -> None:
+        super().__init__(coordinator)
+
+        helen_entries = list(coordinator.hass.config_entries.async_entries(DOMAIN))
+        is_first_entry = (
+            len(helen_entries) >= 1 and helen_entries[0] == coordinator.config_entry
+        )
+
+        if is_first_entry:
+            self._attr_unique_id = f"{coordinator.config_entry.entry_id}_total_cost"
+        else:
+            entry_index = next(
+                (
+                    i
+                    for i, entry in enumerate(helen_entries)
+                    if entry == coordinator.config_entry
+                ),
+                1,
+            )
+            self._attr_unique_id = (
+                f"{coordinator.config_entry.entry_id}_total_cost_{entry_index + 1}"
+            )
+
+        if name:
+            self._attr_name = name
+        elif is_first_entry:
+            self._attr_name = get_legacy_entity_name("total_cost")
+        else:
+            delivery_site = coordinator.config_entry.data.get(CONF_DELIVERY_SITE_ID)
+            suffix = f"Site {delivery_site}" if delivery_site else str(entry_index + 1)
+            self._attr_name = f"Helen Total Cost ({suffix})"
+
+        self._cost_mode = cost_mode
+        self._default_base_price = default_base_price
+        self._default_unit_price = default_unit_price
+
+        self._store: Store | None = None
+        self._store_lock = asyncio.Lock()
+
+        self._offset_eur: float = 0.0
+        self._current_month_key: str | None = None
+        self._last_month_cost_so_far_eur: float | None = None
+        self._last_total_eur: float | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+
+        store_key = f"{DOMAIN}_total_cost_{self.coordinator.config_entry.entry_id}_{self._attr_unique_id}"
+        self._store = Store(self.hass, 1, store_key)
+
+        stored = await self._store.async_load() or {}
+        self._current_month_key = stored.get("month")
+        self._offset_eur = float(stored.get("offset_eur", 0.0) or 0.0)
+        self._last_month_cost_so_far_eur = stored.get("last_month_cost_so_far_eur")
+        self._last_total_eur = stored.get("last_total_eur")
+
+        self._recalculate()
+        await self._async_store_state()
+
+        self.async_on_remove(self.coordinator.async_add_listener(self._on_coordinator_update))
+
+    @callback
+    def _on_coordinator_update(self) -> None:
+        self._recalculate()
+        self.hass.async_create_task(self._async_store_state())
+        self.async_write_ha_state()
+
+    def _month_key_now(self) -> str:
+        now_local = dt_util.now()
+        return f"{now_local.year:04d}-{now_local.month:02d}"
+
+    def _prorated_current_month_base_price(self, data: dict[str, Any]) -> float:
+        monthly_base = (
+            float(self._default_base_price)
+            if self._default_base_price is not None
+            else float(data.get("contract_base_price") or 0.0)
+        )
+        contract_start = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_START_DATE))
+        contract_end = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_END_DATE))
+        base = _prorated_monthly_base_price(monthly_base, dt_util.now().date(), contract_start, contract_end)
+        return safe_round(base)
+
+    def _unit_price_cents(self, data: dict[str, Any]) -> float:
+        if self._default_unit_price is not None:
+            return float(self._default_unit_price)
+        return float(data.get("unit_price") or 0.0)
+
+    def _current_month_cost_so_far(self, data: dict[str, Any]) -> float | None:
+        base_price = self._prorated_current_month_base_price(data)
+
+        if self._cost_mode == CONTRACT_TYPE_FIXED:
+            consumption = float(data.get("current_month_consumption") or 0.0)
+            unit_price_cents = self._unit_price_cents(data)
+            return base_price + (consumption * unit_price_cents / 100.0)
+
+        if self._cost_mode == CONTRACT_TYPE_MARKET:
+            market_prices = data.get("market_prices") or {}
+            current_month_price_cents = market_prices.get("current_month")
+            if current_month_price_cents is None:
+                return None
+            consumption = float(data.get("current_month_consumption") or 0.0)
+            return base_price + (consumption * float(current_month_price_cents) / 100.0)
+
+        if self._cost_mode == CONTRACT_TYPE_EXCHANGE:
+            exchange_costs = data.get("exchange_costs")
+            if not exchange_costs:
+                return None
+            return base_price + float(exchange_costs.get("current_month") or 0.0)
+
+        if self._cost_mode == "smart_guarantee":
+            smart = data.get("smart_guarantee")
+            if not smart:
+                return None
+            impact_cents = float(smart.get("current_month_impact") or 0.0)
+            consumption = float(data.get("current_month_consumption") or 0.0)
+            unit_price_cents = self._unit_price_cents(data)
+            return base_price + (consumption * (unit_price_cents + impact_cents) / 100.0)
+
+        return None
+
+    def _recalculate(self) -> None:
+        if self.coordinator.data is None:
+            return
+
+        month_key = self._month_key_now()
+        if self._current_month_key is None:
+            self._current_month_key = month_key
+        elif month_key != self._current_month_key:
+            if self._last_month_cost_so_far_eur is not None:
+                self._offset_eur += float(self._last_month_cost_so_far_eur)
+            self._current_month_key = month_key
+            self._last_month_cost_so_far_eur = None
+
+        month_cost = self._current_month_cost_so_far(self.coordinator.data)
+        if month_cost is None:
+            return
+
+        self._last_month_cost_so_far_eur = float(month_cost)
+        total = float(self._offset_eur) + float(month_cost)
+
+        if self._last_total_eur is not None and total < float(self._last_total_eur):
+            total = float(self._last_total_eur)
+        self._last_total_eur = total
+
+    async def _async_store_state(self) -> None:
+        if self._store is None:
+            return
+        async with self._store_lock:
+            await self._store.async_save(
+                {
+                    "month": self._current_month_key,
+                    "offset_eur": self._offset_eur,
+                    "last_month_cost_so_far_eur": self._last_month_cost_so_far_eur,
+                    "last_total_eur": self._last_total_eur,
+                }
+            )
+
+    @property
+    def native_value(self) -> float | None:
+        self._recalculate()
+        return safe_round(self._last_total_eur) if self._last_total_eur is not None else None
 
 
 class HelenTransferPrice(CoordinatorEntity, SensorEntity):
