@@ -156,6 +156,34 @@ class TestHelenFixedPriceElectricity:
             expected_value = round(150.5 * 8.5 / 100 + 5.0, 2)
             assert attributes["current_month_cost_estimate"] == expected_value
 
+    def test_fixed_price_sensor_prorates_base_price_for_partial_month_contract(
+        self, mock_coordinator, mock_coordinator_data
+    ):
+        """Test that base price is prorated when contract starts mid-month."""
+        mock_data = dict(mock_coordinator_data)
+        mock_data["contract_start_date"] = "2025-12-10T00:00:00"
+        mock_data["contract_end_date"] = None
+        mock_coordinator.data = mock_data
+
+        with (
+            patch(
+                "custom_components.helen_energy.migration.should_use_legacy_names",
+                return_value=False,
+            ),
+            patch(
+                "custom_components.helen_energy.sensor.dt_util.now",
+                return_value=datetime(2025, 12, 15, tzinfo=timezone.utc),
+            ),
+        ):
+            sensor = HelenFixedPriceElectricity(mock_coordinator)
+
+            # December has 31 days; contract active from 10th -> 31st inclusive (22 days).
+            expected_prorated_base = round(5.0 * (22 / 31), 2)
+            expected_value = round(150.5 * 8.5 / 100 + expected_prorated_base, 2)
+
+            assert sensor.native_value == expected_value
+            assert sensor.extra_state_attributes["current_month_cost_estimate"] == expected_value
+
 
 class TestHelenMarketPriceElectricity:
     """Test HelenMarketPriceElectricity sensor."""

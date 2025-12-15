@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -98,6 +99,9 @@ STATE_ATTR_PRICE_NEXT_MONTH = "price_next_month"
 STATE_ATTR_FIXED_UNIT_PRICE = "fixed_unit_price"
 STATE_ATTR_FIXED_UNIT_PRICE_UNIT_OF_MEASUREMENT = "fixed_unit_price_unit_of_measurement"
 
+DATA_ATTR_CONTRACT_START_DATE = "contract_start_date"
+DATA_ATTR_CONTRACT_END_DATE = "contract_end_date"
+
 
 class HelenDataCoordinator(DataUpdateCoordinator):
     """Coordinator to handle Helen data updates."""
@@ -181,6 +185,14 @@ class HelenDataCoordinator(DataUpdateCoordinator):
                 data["contract_type"] = await self.hass.async_add_executor_job(
                     self.api_client.get_contract_type
                 )
+
+                contract = getattr(self.api_client, "_selected_contract", None)
+                if isinstance(contract, dict):
+                    data[DATA_ATTR_CONTRACT_START_DATE] = contract.get("start_date")
+                    data[DATA_ATTR_CONTRACT_END_DATE] = contract.get("end_date")
+                else:
+                    data[DATA_ATTR_CONTRACT_START_DATE] = None
+                    data[DATA_ATTR_CONTRACT_END_DATE] = None
 
                 # Get prices based on contract type
                 try:
@@ -511,6 +523,49 @@ def _parse_helen_datetime(value: str) -> datetime:
     return dt_util.as_utc(parsed)
 
 
+def _parse_helen_contract_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+    return dt_util.as_local(parsed)
+
+
+def _prorated_monthly_base_price(
+    monthly_base_price: float,
+    month_day: date,
+    contract_start: datetime | None,
+    contract_end: datetime | None,
+) -> float:
+    month_start = month_day.replace(day=1)
+    month_end = month_start + relativedelta(months=1) - timedelta(days=1)
+
+    if contract_end is not None and contract_end.date() < month_start:
+        return 0.0
+
+    active_start = contract_start.date() if contract_start else month_start
+    active_start = max(active_start, month_start)
+
+    active_end = contract_end.date() if contract_end else month_end
+    active_end = min(active_end, month_end)
+
+    if active_end < active_start:
+        return 0.0
+
+    days_in_month = calendar.monthrange(month_start.year, month_start.month)[1]
+    active_days = (active_end - active_start).days + 1
+    active_days = max(0, min(active_days, days_in_month))
+
+    return monthly_base_price * (active_days / days_in_month)
+
+
 def _build_hourly_consumption_kwh_from_quarters(
     quarter_series: list[Any], now_utc: datetime
 ) -> dict[datetime, float]:
@@ -667,6 +722,42 @@ class HelenBaseSensor(CoordinatorEntity, SensorEntity):
             STATE_ATTR_CURRENT_MONTH_COST_ESTIMATE: current_month_cost_estimate,
         }
 
+    def _get_current_month_base_price(self, data: dict[str, Any]) -> float:
+        """Get base price for the current month, prorated for partial-month contracts."""
+        monthly_base = (
+            float(self._default_base_price)
+            if self._default_base_price is not None
+            else float(data.get("contract_base_price") or 0.0)
+        )
+        contract_start = _parse_helen_contract_datetime(
+            data.get(DATA_ATTR_CONTRACT_START_DATE)
+        )
+        contract_end = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_END_DATE))
+
+        month_day = dt_util.now().date()
+        base = _prorated_monthly_base_price(
+            monthly_base, month_day, contract_start, contract_end
+        )
+        return safe_round(base)
+
+    def _get_last_month_base_price(self, data: dict[str, Any]) -> float:
+        """Get base price for last month, prorated for partial-month contracts."""
+        monthly_base = (
+            float(self._default_base_price)
+            if self._default_base_price is not None
+            else float(data.get("contract_base_price") or 0.0)
+        )
+        contract_start = _parse_helen_contract_datetime(
+            data.get(DATA_ATTR_CONTRACT_START_DATE)
+        )
+        contract_end = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_END_DATE))
+
+        month_day = (dt_util.now() + relativedelta(months=-1)).date()
+        base = _prorated_monthly_base_price(
+            monthly_base, month_day, contract_start, contract_end
+        )
+        return safe_round(base)
+
 
 class HelenMarketPriceElectricity(HelenBaseSensor):
     """Helen market price electricity sensor."""
@@ -694,7 +785,7 @@ class HelenMarketPriceElectricity(HelenBaseSensor):
 
         data = self.coordinator.data
         market_prices = data.get("market_prices") or {}
-        base_price = self._get_base_price(data)
+        base_price = self._get_current_month_base_price(data)
         current_month_consumption = data.get("current_month_consumption", 0)
         daily_average_consumption = data.get("daily_average_consumption", 0)
 
@@ -725,8 +816,9 @@ class HelenMarketPriceElectricity(HelenBaseSensor):
 
         # Calculate last month total cost
         last_month_price = market_prices.get("last_month", 0) / 100
+        last_month_base_price = self._get_last_month_base_price(data)
         last_month_total_cost = safe_round(
-            last_month_price * last_month_consumption + base_price
+            last_month_price * last_month_consumption + last_month_base_price
         )
 
         # Use default unit price for current month if set
@@ -776,7 +868,7 @@ class HelenExchangeElectricity(HelenBaseSensor):
             return None
 
         data = self.coordinator.data
-        base_price = self._get_base_price(data)
+        base_price = self._get_current_month_base_price(data)
         exchange_costs = data.get("exchange_costs")
 
         if not exchange_costs:
@@ -797,7 +889,10 @@ class HelenExchangeElectricity(HelenBaseSensor):
         if not exchange_costs:
             return self._get_consumption_attributes(data)
 
-        last_month_total_cost = safe_round(exchange_costs["last_month"] + base_price)
+        last_month_base_price = self._get_last_month_base_price(data)
+        last_month_total_cost = safe_round(
+            exchange_costs["last_month"] + last_month_base_price
+        )
 
         attributes = {
             STATE_ATTR_CONTRACT_BASE_PRICE: base_price,
@@ -836,7 +931,7 @@ class HelenSmartGuarantee(HelenBaseSensor):
         if not smart_guarantee:
             return None
 
-        base_price = self._get_base_price(data)
+        base_price = self._get_current_month_base_price(data)
         current_month_consumption = data.get("current_month_consumption", 0)
         current_month_impact = smart_guarantee["current_month_impact"]
         unit_price = self._get_unit_price(data)
@@ -902,7 +997,7 @@ class HelenFixedPriceElectricity(HelenBaseSensor):
             return None
 
         data = self.coordinator.data
-        base_price = self._get_base_price(data)
+        base_price = self._get_current_month_base_price(data)
         current_month_consumption = data.get("current_month_consumption", 0)
         unit_price = self._get_unit_price(data)
 
