@@ -623,6 +623,8 @@ class HelenBaseSensor(CoordinatorEntity, SensorEntity):
 
     _attr_native_unit_of_measurement = "EUR"
     _attr_icon = "mdi:currency-eur"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(
         self,
@@ -1093,6 +1095,8 @@ class HelenTransferPrice(CoordinatorEntity, SensorEntity):
 
     _attr_native_unit_of_measurement = "EUR"
     _attr_icon = "mdi:currency-eur"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(self, coordinator: HelenDataCoordinator) -> None:
         """Initialize the sensor."""

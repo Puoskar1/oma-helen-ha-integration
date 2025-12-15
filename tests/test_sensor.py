@@ -131,6 +131,9 @@ class TestHelenFixedPriceElectricity:
         ):
             sensor = HelenFixedPriceElectricity(mock_coordinator)
 
+            assert sensor.device_class == "monetary"
+            assert sensor.state_class == "total"
+
             # Expected: (150.5 * 8.5 / 100) + 5.0 = 12.7925 + 5.0 = 17.7925 -> round(17.7925, 2) = 17.79
             expected_value = round(150.5 * 8.5 / 100 + 5.0, 2)
             assert sensor.native_value == expected_value
