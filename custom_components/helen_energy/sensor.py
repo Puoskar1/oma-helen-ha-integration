@@ -87,7 +87,8 @@ STATE_ATTR_CURRENT_MONTH_PRICE_WITH_IMPACT = "current_month_price_with_impact"
 STATE_ATTR_LAST_MONTH_TOTAL_COST = "last_month_total_cost"
 STATE_ATTR_CURRENT_MONTH_TOTAL_COST = "current_month_total_cost"
 
-# market price
+# cost helper attributes
+STATE_ATTR_CURRENT_MONTH_COST_SO_FAR = "current_month_cost_so_far"
 STATE_ATTR_CURRENT_MONTH_COST_ESTIMATE = "current_month_cost_estimate"
 
 # market price
@@ -538,17 +539,14 @@ def _parse_helen_contract_datetime(value: str | None) -> datetime | None:
     return dt_util.as_local(parsed)
 
 
-def _prorated_monthly_base_price(
-    monthly_base_price: float,
-    month_day: date,
-    contract_start: datetime | None,
-    contract_end: datetime | None,
-) -> float:
+def _contract_active_days_in_month(
+    month_day: date, contract_start: datetime | None, contract_end: datetime | None
+) -> int:
     month_start = month_day.replace(day=1)
     month_end = month_start + relativedelta(months=1) - timedelta(days=1)
 
     if contract_end is not None and contract_end.date() < month_start:
-        return 0.0
+        return 0
 
     active_start = contract_start.date() if contract_start else month_start
     active_start = max(active_start, month_start)
@@ -557,10 +555,20 @@ def _prorated_monthly_base_price(
     active_end = min(active_end, month_end)
 
     if active_end < active_start:
-        return 0.0
+        return 0
 
+    return (active_end - active_start).days + 1
+
+
+def _prorated_monthly_base_price(
+    monthly_base_price: float,
+    month_day: date,
+    contract_start: datetime | None,
+    contract_end: datetime | None,
+) -> float:
+    month_start = month_day.replace(day=1)
     days_in_month = calendar.monthrange(month_start.year, month_start.month)[1]
-    active_days = (active_end - active_start).days + 1
+    active_days = _contract_active_days_in_month(month_day, contract_start, contract_end)
     active_days = max(0, min(active_days, days_in_month))
 
     return monthly_base_price * (active_days / days_in_month)
@@ -705,9 +713,9 @@ class HelenBaseSensor(CoordinatorEntity, SensorEntity):
 
     def _get_consumption_attributes(self, data: dict[str, Any]) -> dict[str, Any]:
         """Get common consumption attributes."""
-        current_month_cost_estimate = (
-            safe_round(self.native_value) if self.native_value is not None else None
-        )
+        cost_so_far = safe_round(self.native_value) if self.native_value is not None else None
+        monthly_estimate = self._get_current_month_bill_estimate(data)
+        current_month_cost_estimate = safe_round(monthly_estimate) if monthly_estimate is not None else None
         return {
             STATE_ATTR_CURRENT_MONTH_CONSUMPTION: safe_round(
                 data.get("current_month_consumption", 0)
@@ -719,8 +727,13 @@ class HelenBaseSensor(CoordinatorEntity, SensorEntity):
                 data.get("daily_average_consumption", 0)
             ),
             STATE_ATTR_CONSUMPTION_UNIT_OF_MEASUREMENT: "kWh",
+            STATE_ATTR_CURRENT_MONTH_COST_SO_FAR: cost_so_far,
             STATE_ATTR_CURRENT_MONTH_COST_ESTIMATE: current_month_cost_estimate,
         }
+
+    def _get_current_month_bill_estimate(self, data: dict[str, Any]) -> float | None:
+        """Return an estimate for the current billing cycle total cost."""
+        return None
 
     def _get_current_month_base_price(self, data: dict[str, Any]) -> float:
         """Get base price for the current month, prorated for partial-month contracts."""
@@ -843,6 +856,23 @@ class HelenMarketPriceElectricity(HelenBaseSensor):
         }
         attributes.update(self._get_consumption_attributes(data))
         return attributes
+
+    def _get_current_month_bill_estimate(self, data: dict[str, Any]) -> float | None:
+        market_prices = data.get("market_prices") or {}
+        current_month_price_cents = market_prices.get("current_month")
+        if current_month_price_cents is None:
+            return None
+
+        contract_start = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_START_DATE))
+        contract_end = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_END_DATE))
+        month_day = dt_util.now().date()
+        active_days = _contract_active_days_in_month(month_day, contract_start, contract_end)
+        if active_days <= 0:
+            return 0.0
+
+        avg_daily_kwh = float(data.get("daily_average_consumption") or 0.0)
+        base_price = self._get_current_month_base_price(data)
+        return base_price + (avg_daily_kwh * active_days * (float(current_month_price_cents) / 100.0))
 
 
 class HelenExchangeElectricity(HelenBaseSensor):
@@ -971,6 +1001,25 @@ class HelenSmartGuarantee(HelenBaseSensor):
         attributes.update(self._get_consumption_attributes(data))
         return attributes
 
+    def _get_current_month_bill_estimate(self, data: dict[str, Any]) -> float | None:
+        smart_guarantee = data.get("smart_guarantee")
+        if not smart_guarantee:
+            return None
+
+        contract_start = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_START_DATE))
+        contract_end = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_END_DATE))
+        month_day = dt_util.now().date()
+        active_days = _contract_active_days_in_month(month_day, contract_start, contract_end)
+        if active_days <= 0:
+            return 0.0
+
+        avg_daily_kwh = float(data.get("daily_average_consumption") or 0.0)
+        base_price = self._get_current_month_base_price(data)
+        unit_price_cents = float(self._get_unit_price(data))
+        impact_cents = float(smart_guarantee.get("current_month_impact") or 0.0)
+        eur_per_kwh = (unit_price_cents + impact_cents) / 100.0
+        return base_price + (avg_daily_kwh * active_days * eur_per_kwh)
+
 
 class HelenFixedPriceElectricity(HelenBaseSensor):
     """Helen fixed price electricity sensor."""
@@ -1024,6 +1073,19 @@ class HelenFixedPriceElectricity(HelenBaseSensor):
         }
         attributes.update(self._get_consumption_attributes(data))
         return attributes
+
+    def _get_current_month_bill_estimate(self, data: dict[str, Any]) -> float | None:
+        contract_start = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_START_DATE))
+        contract_end = _parse_helen_contract_datetime(data.get(DATA_ATTR_CONTRACT_END_DATE))
+        month_day = dt_util.now().date()
+        active_days = _contract_active_days_in_month(month_day, contract_start, contract_end)
+        if active_days <= 0:
+            return 0.0
+
+        avg_daily_kwh = float(data.get("daily_average_consumption") or 0.0)
+        unit_price_cents = float(self._get_unit_price(data))
+        base_price = self._get_current_month_base_price(data)
+        return base_price + (avg_daily_kwh * active_days * (unit_price_cents / 100.0))
 
 
 class HelenTransferPrice(CoordinatorEntity, SensorEntity):

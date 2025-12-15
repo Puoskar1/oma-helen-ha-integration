@@ -141,9 +141,15 @@ class TestHelenFixedPriceElectricity:
         """Test fixed price sensor extra state attributes."""
         mock_coordinator.data = mock_coordinator_data
 
-        with patch(
-            "custom_components.helen_energy.migration.should_use_legacy_names",
-            return_value=False,
+        with (
+            patch(
+                "custom_components.helen_energy.migration.should_use_legacy_names",
+                return_value=False,
+            ),
+            patch(
+                "custom_components.helen_energy.sensor.dt_util.now",
+                return_value=datetime(2025, 12, 15, tzinfo=timezone.utc),
+            ),
         ):
             sensor = HelenFixedPriceElectricity(mock_coordinator)
             attributes = sensor.extra_state_attributes
@@ -153,8 +159,10 @@ class TestHelenFixedPriceElectricity:
             assert attributes["daily_average_consumption"] == 4.8
             assert attributes["fixed_unit_price"] == 8.5
             assert attributes["contract_base_price"] == 5.0
-            expected_value = round(150.5 * 8.5 / 100 + 5.0, 2)
-            assert attributes["current_month_cost_estimate"] == expected_value
+            expected_so_far = round(150.5 * 8.5 / 100 + 5.0, 2)
+            expected_estimate = round(5.0 + (4.8 * 31) * (8.5 / 100), 2)
+            assert attributes["current_month_cost_so_far"] == expected_so_far
+            assert attributes["current_month_cost_estimate"] == expected_estimate
 
     def test_fixed_price_sensor_prorates_base_price_for_partial_month_contract(
         self, mock_coordinator, mock_coordinator_data
@@ -179,10 +187,17 @@ class TestHelenFixedPriceElectricity:
 
             # December has 31 days; contract active from 10th -> 31st inclusive (22 days).
             expected_prorated_base = round(5.0 * (22 / 31), 2)
-            expected_value = round(150.5 * 8.5 / 100 + expected_prorated_base, 2)
+            expected_so_far = round(150.5 * 8.5 / 100 + expected_prorated_base, 2)
+            expected_estimate = round(
+                expected_prorated_base + (4.8 * 22) * (8.5 / 100), 2
+            )
 
-            assert sensor.native_value == expected_value
-            assert sensor.extra_state_attributes["current_month_cost_estimate"] == expected_value
+            assert sensor.native_value == expected_so_far
+            assert sensor.extra_state_attributes["current_month_cost_so_far"] == expected_so_far
+            assert (
+                sensor.extra_state_attributes["current_month_cost_estimate"]
+                == expected_estimate
+            )
 
 
 class TestHelenMarketPriceElectricity:
@@ -217,9 +232,15 @@ class TestHelenMarketPriceElectricity:
         """Test market price sensor extra state attributes."""
         mock_coordinator.data = mock_coordinator_data
 
-        with patch(
-            "custom_components.helen_energy.migration.should_use_legacy_names",
-            return_value=False,
+        with (
+            patch(
+                "custom_components.helen_energy.migration.should_use_legacy_names",
+                return_value=False,
+            ),
+            patch(
+                "custom_components.helen_energy.sensor.dt_util.now",
+                return_value=datetime(2025, 12, 15, tzinfo=timezone.utc),
+            ),
         ):
             sensor = HelenMarketPriceElectricity(mock_coordinator)
             attributes = sensor.extra_state_attributes
@@ -230,9 +251,12 @@ class TestHelenMarketPriceElectricity:
             assert attributes["price_current_month"] == 90.0
             assert attributes["price_last_month"] == 85.0
             assert attributes["price_next_month"] == 88.0
-            # Exposed for UI selection (Tile card etc.)
-            expected_value = round(5.0 + (90.0 / 100) * 150.5 + (2 * 4.8) * (90.0 / 100), 2)
-            assert attributes["current_month_cost_estimate"] == expected_value
+            expected_so_far = round(
+                5.0 + (90.0 / 100) * 150.5 + (2 * 4.8) * (90.0 / 100), 2
+            )
+            expected_estimate = round(5.0 + (4.8 * 31) * (90.0 / 100), 2)
+            assert attributes["current_month_cost_so_far"] == expected_so_far
+            assert attributes["current_month_cost_estimate"] == expected_estimate
 
 
 class TestHelenExchangeElectricity:
