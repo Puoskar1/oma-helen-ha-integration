@@ -650,6 +650,9 @@ class HelenBaseSensor(CoordinatorEntity, SensorEntity):
 
     def _get_consumption_attributes(self, data: dict[str, Any]) -> dict[str, Any]:
         """Get common consumption attributes."""
+        current_month_cost_estimate = (
+            safe_round(self.native_value) if self.native_value is not None else None
+        )
         return {
             STATE_ATTR_CURRENT_MONTH_CONSUMPTION: safe_round(
                 data.get("current_month_consumption", 0)
@@ -661,6 +664,7 @@ class HelenBaseSensor(CoordinatorEntity, SensorEntity):
                 data.get("daily_average_consumption", 0)
             ),
             STATE_ATTR_CONSUMPTION_UNIT_OF_MEASUREMENT: "kWh",
+            STATE_ATTR_CURRENT_MONTH_COST_ESTIMATE: current_month_cost_estimate,
         }
 
 
@@ -718,8 +722,6 @@ class HelenMarketPriceElectricity(HelenBaseSensor):
         market_prices = data.get("market_prices") or {}
         base_price = self._get_base_price(data)
         last_month_consumption = data.get("last_month_consumption", 0)
-        current_month_consumption = data.get("current_month_consumption", 0)
-        daily_average_consumption = data.get("daily_average_consumption", 0)
 
         # Calculate last month total cost
         last_month_price = market_prices.get("last_month", 0) / 100
@@ -733,19 +735,10 @@ class HelenMarketPriceElectricity(HelenBaseSensor):
             if self._default_unit_price is not None
             else market_prices.get("current_month")
         )
-        current_month_price_eur = (
-            float(current_month_price_cents) / 100 if current_month_price_cents else 0.0
-        )
-        current_month_cost_estimate = safe_round(
-            base_price
-            + (current_month_price_eur * current_month_consumption)
-            + (2 * daily_average_consumption * current_month_price_eur)
-        )
 
         attributes = {
             STATE_ATTR_CONTRACT_BASE_PRICE: base_price,
             STATE_ATTR_LAST_MONTH_TOTAL_COST: last_month_total_cost,
-            STATE_ATTR_CURRENT_MONTH_COST_ESTIMATE: current_month_cost_estimate,
             STATE_ATTR_PRICE_LAST_MONTH: safe_round(market_prices.get("last_month"))
             if market_prices.get("last_month") is not None
             else None,

@@ -153,6 +153,8 @@ class TestHelenFixedPriceElectricity:
             assert attributes["daily_average_consumption"] == 4.8
             assert attributes["fixed_unit_price"] == 8.5
             assert attributes["contract_base_price"] == 5.0
+            expected_value = round(150.5 * 8.5 / 100 + 5.0, 2)
+            assert attributes["current_month_cost_estimate"] == expected_value
 
 
 class TestHelenMarketPriceElectricity:
