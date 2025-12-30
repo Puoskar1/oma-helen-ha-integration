@@ -1534,7 +1534,9 @@ class HelenMonthlyConsumption(CoordinatorEntity, SensorEntity):
                 _LOGGER.debug("Recorder statistics unavailable, skipping import: %s", err)
                 return
 
-            current_local_date = dt_util.now().date()
+            # API only provides data up to yesterday, not current day
+            # Request data up to yesterday, but handle case where it might not be available yet
+            current_local_date = dt_util.now().date() - timedelta(days=1)
             month_start_date = current_local_date.replace(day=1)
 
             stored = await self._statistics_store.async_load() or {}
@@ -1591,7 +1593,19 @@ class HelenMonthlyConsumption(CoordinatorEntity, SensorEntity):
             latest_hour = max(hourly_state)
             self._month_total_from_quarters = hourly_state[latest_hour]
 
-            if import_start_utc is None:
+            # Detect if there's a significant gap in imported data (more than 2 days)
+            # This indicates we may have missed data and should backfill
+            should_backfill = False
+            if import_start_utc is not None:
+                gap_days = (latest_hour - import_start_utc).total_seconds() / 86400
+                if gap_days > 2:
+                    _LOGGER.info(
+                        "Detected gap of %.1f days in hourly statistics, backfilling from start of available data",
+                        gap_days,
+                    )
+                    should_backfill = True
+
+            if import_start_utc is None or should_backfill:
                 import_start_utc = min(hourly_state)
             else:
                 import_start_utc = max(
