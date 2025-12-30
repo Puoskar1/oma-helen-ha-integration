@@ -1631,7 +1631,6 @@ class HelenMonthlyConsumption(CoordinatorEntity, SensorEntity):
             metadata = {
                 "has_mean": False,
                 "has_sum": True,
-                "mean_type": None,  # Required when has_mean is False
                 "name": None,
                 "source": RECORDER_DOMAIN,
                 "statistic_id": self.entity_id,
