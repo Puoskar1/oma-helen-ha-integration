@@ -1640,7 +1640,17 @@ class HelenMonthlyConsumption(CoordinatorEntity, SensorEntity):
             try:
                 recorder_statistics.async_import_statistics(self.hass, metadata, stats)
             except Exception as err:
-                _LOGGER.debug("Failed to import statistics: %s", err)
+                # Handle database constraint errors that may occur due to Home Assistant
+                # trying to update mean_type to None when it's not allowed
+                error_str = str(err)
+                if "mean_type" in error_str and "NOT NULL" in error_str:
+                    _LOGGER.warning(
+                        "Statistics import failed due to database constraint (likely Home Assistant bug with mean_type). "
+                        "This may resolve itself on the next import. Error: %s",
+                        err,
+                    )
+                else:
+                    _LOGGER.debug("Failed to import statistics: %s", err)
                 return
 
             last = stats[-1]
